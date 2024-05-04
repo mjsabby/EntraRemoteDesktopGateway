@@ -530,7 +530,7 @@ namespace EntraRemoteDesktopGateway
                 return false;
             }
 
-            email = payload.GetProperty("upn").GetString();
+            email = payload.GetProperty("preferred_username").GetString();
             return true;
         }
 
@@ -645,8 +645,8 @@ namespace EntraRemoteDesktopGateway
 
                 try
                 {
-                    receiveBuffer = ArrayPool<byte>.Shared.Rent(4096);
-                    sendBuffer = ArrayPool<byte>.Shared.Rent(4096);
+                    receiveBuffer = ArrayPool<byte>.Shared.Rent(8192);
+                    sendBuffer = ArrayPool<byte>.Shared.Rent(8192);
                     await WebSocketLoop(ws, receiveBuffer, sendBuffer, func, cancellationToken).ConfigureAwait(false);
                 }
                 finally
