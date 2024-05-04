@@ -129,7 +129,7 @@ namespace EntraRemoteDesktopGateway
 
             app.Map("/remoteDesktopGateway", async (HttpContext context, CancellationToken cancellationToken) =>
             {
-                await HandleRemoteDesktopGateway(context, (string idToken) => AuthenticateAndGetServerList(idToken, authConfig.PublicKeys, config.AllowedUsers, authConfig), cancellationToken).ConfigureAwait(false);
+                await HandleRemoteDesktopGateway(context, (string upn) => AuthenticateAndGetServerList(upn, config.AllowedUsers), cancellationToken).ConfigureAwait(false);
             });
 
             app.Map("/", async (HttpContext context, CancellationToken cancellationToken) =>
@@ -233,7 +233,13 @@ namespace EntraRemoteDesktopGateway
                 var cookieLength = BitConverter.ToUInt16(receiveBuffer, offset);
                 var cookie = Encoding.Unicode.GetString(receiveBuffer, offset + sizeof(ushort), cookieLength - 2);
 
-                (var authorized, context.AllowedServers) = authorizeAndGetServerList(cookie);
+                bool authorized = false;
+                string? upn = await GetUserPrincipalNameAsync(cookie).ConfigureAwait(false);
+                if (!string.IsNullOrEmpty(upn))
+                {
+                    (authorized, context.AllowedServers) = authorizeAndGetServerList(upn);
+                }
+
                 if (!authorized)
                 {
                     tunnelResponse.StatusCode = 0x800759F8; // E_PROXY_COOKIE_AUTHENTICATION_ACCESS_DENIED
@@ -364,13 +370,13 @@ namespace EntraRemoteDesktopGateway
             await ws.SendAsync(new ReadOnlyMemory<byte>(sendBuffer, 0, Marshal.SizeOf<HTTP_CLOSE_CHANNEL_RESPONSE>()), WebSocketMessageType.Binary, endOfMessage: true, cancellationToken).ConfigureAwait(false);
         }
 
-        private static async Task<string?> GetIdTokenFromRefreshToken(string tokenUrl, string refreshToken, string clientId)
+        private static async Task<string?> GetAccessTokenFromRefreshToken(string tokenUrl, string refreshToken, string clientId)
         {
             using var httpClient = new HttpClient();
             using var requestBody = new FormUrlEncodedContent(
             [
                 new KeyValuePair<string, string>("client_id", clientId),
-                new KeyValuePair<string, string>("scope", "openid"),
+                new KeyValuePair<string, string>("scope", "https://graph.microsoft.com/.default"),
                 new KeyValuePair<string, string>("refresh_token", refreshToken),
                 new KeyValuePair<string, string>("grant_type", "refresh_token")
             ]);
@@ -378,17 +384,17 @@ namespace EntraRemoteDesktopGateway
             var response = await httpClient.PostAsync(new Uri(tokenUrl), requestBody).ConfigureAwait(false);
             var responseContent = await response.Content.ReadAsStringAsync().ConfigureAwait(false);
 
-            string? idToken = null;
+            string? accessToken = null;
             using var doc = JsonDocument.Parse(responseContent);
             foreach (var e in doc.RootElement.EnumerateObject())
             {
-                if (e.NameEquals("id_token"))
+                if (e.NameEquals("access_token"))
                 {
-                    idToken = e.Value.GetString();
+                    accessToken = e.Value.GetString();
                 }
             }
 
-            return idToken;
+            return accessToken;
         }
 
         private static async Task<(string? refreshToken, string? idToken)> ExchangeCodeForTokens(string tokenUrl, string clientId, string redirectUrl, string code, CancellationToken cancellationToken)
@@ -528,31 +534,14 @@ namespace EntraRemoteDesktopGateway
             return true;
         }
 
-        private static (bool, HashSet<string>?) AuthenticateAndGetServerList(string idToken, Dictionary<string, RSA> keys, Dictionary<string, HashSet<string>> allowUsers, AADTenantConfig config)
+        private static (bool, HashSet<string>?) AuthenticateAndGetServerList(string email, Dictionary<string, HashSet<string>> allowedUsers)
         {
-            try
-            {
-                if (!VerifyRS256JWTSignature(idToken, keys, out var payloadJson))
-                {
-                    return (false, null);
-                }
-
-                if (!ValidateJWTAndExtractEmail(payloadJson, config.Issuer, config.ClientId, out var email))
-                {
-                    return (false, null);
-                }
-
-                if (!allowUsers.TryGetValue(email!, out var servers))
-                {
-                    return (false, null);
-                }
-
-                return (true, servers);
-            }
-            catch (FormatException)
+            if (!allowedUsers.TryGetValue(email, out var servers))
             {
                 return (false, null);
             }
+
+            return (true, servers);
         }
 
         private static byte[] AesDecrypt(byte[] cipherText, byte[] key, byte[] iv)
@@ -756,8 +745,8 @@ namespace EntraRemoteDesktopGateway
                 return;
             }
 
-            var idToken = await GetIdTokenFromRefreshToken(authConfig.TokenUrl, refreshToken, authConfig.ClientId).ConfigureAwait(false);
-            string content = $"full address:s:{server}\r\ngatewaycredentialssource:i:5\r\ngatewayaccesstoken:s:{idToken}\r\ngatewayhostname:s:{config.ServerUrl}:{config.Port}\r\ngatewayprofileusagemethod:i:1\r\ngatewayusagemethod:i:1";
+            var accessToken = await GetAccessTokenFromRefreshToken(authConfig.TokenUrl, refreshToken, authConfig.ClientId).ConfigureAwait(false);
+            string content = $"full address:s:{server}\r\ngatewaycredentialssource:i:5\r\ngatewayaccesstoken:s:{accessToken}\r\ngatewayhostname:s:{config.ServerUrl}:{config.Port}\r\ngatewayprofileusagemethod:i:1\r\ngatewayusagemethod:i:1";
             context.Response.ContentType = "text/plain";
             context.Response.Headers.Append("Content-Disposition", $"attachment; filename={server}.rdp");
             await context.Response.Body.WriteAsync(Encoding.UTF8.GetBytes(content), cancellationToken).ConfigureAwait(false);
@@ -985,7 +974,6 @@ namespace EntraRemoteDesktopGateway
 
             if (responseMessage.StatusCode == HttpStatusCode.Forbidden)
             {
-                Console.WriteLine(response);
                 throw new Exception("Failed to get secret from key vault");
             }
 
@@ -999,6 +987,25 @@ namespace EntraRemoteDesktopGateway
             }
 
             return value;
+        }
+
+        private static async Task<string?> GetUserPrincipalNameAsync(string accessToken)
+        {
+            using var httpClient = new HttpClient();
+            httpClient.DefaultRequestHeaders.Authorization = new AuthenticationHeaderValue("Bearer", accessToken);
+            var responseMessage = await httpClient.GetAsync(new Uri("https://graph.microsoft.com/v1.0/me?$select=userPrincipalName")).ConfigureAwait(false);
+            var response = await responseMessage.Content.ReadAsStringAsync().ConfigureAwait(false);
+
+            using JsonDocument document = JsonDocument.Parse(response);
+            var root = document.RootElement;
+            if (root.TryGetProperty("userPrincipalName", out JsonElement upnElement))
+            {
+                return upnElement.GetString();
+            }
+            else
+            {
+                return null;
+            }
         }
 
         private static async Task<byte[]> GetBytesFromUrlAsync(string url)
@@ -1204,7 +1211,7 @@ namespace EntraRemoteDesktopGateway
 
         public string RedirectUrl { get; private set; } = redirectUrl;
 
-        public string LoginUrl { get; private set; } = $"{authorizationUrl}?client_id={clientId}&redirect_uri={redirectUrl}&response_type=code&scope=openid profile offline_access";
+        public string LoginUrl { get; private set; } = $"{authorizationUrl}?client_id={clientId}&redirect_uri={redirectUrl}&response_type=code&scope=openid profile https://graph.microsoft.com/.default offline_access";
 
         public string PublicKeysUrl { get; private set; } = publicKeysUrl;
 
